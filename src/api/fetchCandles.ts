@@ -1,24 +1,40 @@
-import type { Candle, ApiResponse, Symbol, TimeFrame } from '../types';
+import type { Candle, Symbol, TimeFrame } from '../types';
 
-const API_BASE = 'https://widget-data.bitycle.com/c1/api/exchange/widget_data';
-const MIN_DELAY = 250;
-const MAX_FETCH_ATTEMPTS = 20;
-const EMPTY_PAGE_SEARCH_STEP_SECONDS = 60 * 60; // 1 hour
-const MAX_EMPTY_PAGE_SEARCH_ATTEMPTS = 120;
+// ---------------------------------------------------------------------------
+// Twelve Data API
+// Get your free key at: https://twelvedata.com/account/api-keys
+// ---------------------------------------------------------------------------
+const API_KEY = '12cea044900f49b29df57b55293548a2';
+const API_BASE = 'https://api.twelvedata.com/time_series';
+const MAX_PER_REQUEST = 5000; // Twelve Data allows up to 5000 per call
+const MIN_DELAY = 300;        // ms between paginated requests
 const MAX_CONSECUTIVE_ERRORS = 3;
 
-// CORS Proxies to try
-const CORS_PROXIES = [
-  (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-  (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  (url: string) => `https://cors-anywhere.herokuapp.com/${url}`,
-];
+// Map app symbols → Twelve Data symbols
+const SYMBOL_MAP: Record<Symbol, string> = {
+  XAUUSD: 'XAU/USD',
+  XAGUSD: 'XAG/USD',
+  EURUSD: 'EUR/USD',
+  GBPUSD: 'GBP/USD',
+  BTCUSD: 'BTC/USD',
+};
+
+// Map app timeframes → Twelve Data intervals
+const TIMEFRAME_MAP: Record<TimeFrame, string> = {
+  '1m':  '1min',
+  '5m':  '5min',
+  '15m': '15min',
+  '30m': '30min',
+  '1h':  '1h',
+  '4h':  '4h',
+  '1d':  '1day',
+};
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-interface FetchOptions {
+export interface FetchOptions {
   symbol: Symbol;
   timeFrame: TimeFrame;
   candleCount: number;
@@ -26,165 +42,124 @@ interface FetchOptions {
   abortSignal?: AbortSignal;
 }
 
-async function tryFetch(url: string, signal?: AbortSignal): Promise<ApiResponse> {
-  // First try direct fetch
-  try {
-    const directResponse = await fetch(url, {
-      method: 'GET',
-      signal,
-      headers: {
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Origin': 'https://widget-data.bitycle.com',
-        'Referer': 'https://widget-data.bitycle.com/',
-      },
-    });
-    if (directResponse.ok) {
-      const data = await directResponse.json();
-      console.log('Direct fetch succeeded');
-      return data as ApiResponse;
-    }
-  } catch (e) {
-    console.log('Direct fetch failed, trying proxies...', e);
-  }
-
-  // Try each CORS proxy
-  for (let i = 0; i < CORS_PROXIES.length; i++) {
-    const proxyUrl = CORS_PROXIES[i](url);
-    try {
-      console.log(`Trying proxy ${i + 1}/${CORS_PROXIES.length}:`, proxyUrl.substring(0, 60) + '...');
-      const response = await fetch(proxyUrl, {
-        method: 'GET',
-        signal,
-        headers: { 'Accept': 'application/json' },
-      });
-
-      if (response.ok) {
-        const text = await response.text();
-        try {
-          const data = JSON.parse(text);
-          console.log(`Proxy ${i + 1} succeeded`);
-          return data as ApiResponse;
-        } catch {
-          console.log(`Proxy ${i + 1} returned invalid JSON`);
-          continue;
-        }
-      }
-    } catch (e) {
-      console.log(`Proxy ${i + 1} failed:`, e);
-      continue;
-    }
-  }
-
-  throw new Error('All fetch methods failed. The API may be blocking requests.');
+interface TwelveCandle {
+  datetime: string; // "2024-01-15 14:30:00"
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
 }
 
-// Fetch one page of candles ending at the given timestamp
-async function fetchCandlePage(
+interface TwelveResponse {
+  status: string;
+  message?: string;
+  code?: number;
+  values?: TwelveCandle[];
+  meta?: { symbol: string; interval: string; exchange: string };
+}
+
+// Parse "2024-01-15 14:30:00" (UTC) to Unix timestamp
+function parseDatetime(dt: string): number {
+  // Twelve Data daily candles return "2024-01-15" without time
+  const normalized = dt.length === 10 ? `${dt} 00:00:00` : dt;
+  return Math.floor(new Date(`${normalized}Z`).getTime() / 1000);
+}
+
+// Fetch one page ending at (and including) endDatetime
+// endDatetime format: "YYYY-MM-DD HH:mm:ss"
+async function fetchPage(
   symbol: Symbol,
   timeFrame: TimeFrame,
-  endTimestamp: number,
+  outputSize: number,
+  endDatetime: string | null,
   signal?: AbortSignal,
 ): Promise<Candle[]> {
   const params = new URLSearchParams({
-    symbol,
-    time_frame: timeFrame,
-    source: 'alpari',
-    end: endTimestamp.toString(),
+    symbol:   SYMBOL_MAP[symbol],
+    interval: TIMEFRAME_MAP[timeFrame],
+    outputsize: String(outputSize),
+    order:    'DESC', // newest first — we paginate backward
+    apikey:   API_KEY,
   });
 
-  const url = `${API_BASE}?${params.toString()}`;
-  console.log('Fetching:', url);
-
-  const json = await tryFetch(url, signal);
-
-  if (json.status !== 'success') {
-    throw new Error(`API returned status: ${json.status}`);
+  if (endDatetime) {
+    params.set('end_date', endDatetime);
   }
 
-  if (!json.data || !Array.isArray(json.data)) {
+  const url = `${API_BASE}?${params.toString()}`;
+  console.log('Fetching:', url.replace(API_KEY, '***'));
+
+  const response = await fetch(url, {
+    signal,
+    headers: { 'Accept': 'application/json' },
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  }
+
+  const json: TwelveResponse = await response.json();
+
+  if (json.status === 'error') {
+    // Code 429 = rate limit, code 400 = bad params
+    throw new Error(`Twelve Data error ${json.code ?? ''}: ${json.message ?? 'Unknown error'}`);
+  }
+
+  if (!json.values || json.values.length === 0) {
     return [];
   }
 
-  return json.data
-    .filter((c) => c && typeof c.t === 'number')
-    .map((c) => ({
-      t: c.t,
-      o: c.o,
-      h: c.h,
-      l: c.l,
-      c: c.c,
-      v: c.v ?? 0,
-    }));
+  return json.values.map((v) => ({
+    t: parseDatetime(v.datetime),
+    o: parseFloat(v.open),
+    h: parseFloat(v.high),
+    l: parseFloat(v.low),
+    c: parseFloat(v.close),
+    v: parseFloat(v.volume) || 0,
+  }));
 }
 
-// When a page comes back empty, step backward hour-by-hour to find older data
-// (mirrors find_previous_available_page in the Python script)
-async function findPreviousAvailablePage(
-  symbol: Symbol,
-  timeFrame: TimeFrame,
-  endTimestamp: number,
-  signal?: AbortSignal,
-): Promise<Candle[]> {
-  console.log('Empty response — searching backward for older data...');
-
-  let searchEnd = endTimestamp;
-
-  for (let attempt = 1; attempt <= MAX_EMPTY_PAGE_SEARCH_ATTEMPTS; attempt++) {
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-
-    searchEnd -= EMPTY_PAGE_SEARCH_STEP_SECONDS;
-    console.log(
-      `Search attempt ${attempt}/${MAX_EMPTY_PAGE_SEARCH_ATTEMPTS} with end=${searchEnd}` +
-      ` (${new Date(searchEnd * 1000).toISOString()})`,
-    );
-
-    const page = await fetchCandlePage(symbol, timeFrame, searchEnd, signal);
-    if (page.length > 0) {
-      console.log(`Found older data at end=${searchEnd}`);
-      return page;
-    }
-
-    await delay(MIN_DELAY);
-  }
-
-  throw new Error(
-    `Could not find older candle data after searching backward ${MAX_EMPTY_PAGE_SEARCH_ATTEMPTS} hours.`,
+// Format Unix timestamp back to "YYYY-MM-DD HH:mm:ss" for the API end_date param
+function formatEndDate(unixSeconds: number): string {
+  const d = new Date(unixSeconds * 1000);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return (
+    `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}` +
+    ` ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`
   );
 }
 
 export async function fetchAllCandles(options: FetchOptions): Promise<Candle[]> {
   const { symbol, timeFrame, candleCount, onProgress, abortSignal } = options;
 
-  // Key: timestamp → de-duplicated candles
   const candlesByTime = new Map<number, Candle>();
-
-  // Always start from "now" and paginate backward — same as Python's int(time.time())
-  let endTimestamp = Math.floor(Date.now() / 1000);
+  let endDatetime: string | null = null; // null = start from latest (real-time)
   let consecutiveErrors = 0;
 
   console.log(`Starting fetch: ${symbol} ${timeFrame}, requesting ${candleCount} candles`);
 
-  for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
+  while (candlesByTime.size < candleCount) {
     if (abortSignal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
+    const remaining = candleCount - candlesByTime.size;
+    const pageSize = Math.min(remaining, MAX_PER_REQUEST);
+
     console.log(
-      `Page ${attempt}/${MAX_FETCH_ATTEMPTS} — end=${endTimestamp}` +
-      ` (${new Date(endTimestamp * 1000).toISOString()})` +
-      ` — collected ${candlesByTime.size}/${candleCount}`,
+      `Fetching page — end=${endDatetime ?? 'latest'} — ` +
+      `collected ${candlesByTime.size}/${candleCount}`,
     );
 
     try {
-      let page = await fetchCandlePage(symbol, timeFrame, endTimestamp, abortSignal);
-
-      // If the page is empty, search backward hour-by-hour (like Python's fallback)
-      if (page.length === 0) {
-        page = await findPreviousAvailablePage(symbol, timeFrame, endTimestamp, abortSignal);
-      }
-
+      const page = await fetchPage(symbol, timeFrame, pageSize, endDatetime, abortSignal);
       consecutiveErrors = 0;
 
-      // Add new candles (de-duplicate by timestamp)
+      if (page.length === 0) {
+        console.log('Empty page — no more historical data available');
+        break;
+      }
+
+      // page is DESC (newest first), add all
       for (const candle of page) {
         if (!candlesByTime.has(candle.t)) {
           candlesByTime.set(candle.t, candle);
@@ -194,19 +169,12 @@ export async function fetchAllCandles(options: FetchOptions): Promise<Candle[]> 
       onProgress(candlesByTime.size);
       console.log(`Page had ${page.length} candles — total unique: ${candlesByTime.size}`);
 
-      // Enough candles collected — stop
       if (candlesByTime.size >= candleCount) break;
 
-      // Move end pointer to just before the oldest candle on this page
-      const timestamps = page.map((c) => c.t);
-      const oldestTimestamp = Math.min(...timestamps);
-      const nextEnd = oldestTimestamp - 1;
+      // Oldest candle in this page → next end_date is one second before it
+      const oldestTimestamp = Math.min(...page.map((c) => c.t));
+      endDatetime = formatEndDate(oldestTimestamp - 1);
 
-      if (nextEnd >= endTimestamp) {
-        throw new Error('API pagination did not move backward — infinite loop guard triggered.');
-      }
-
-      endTimestamp = nextEnd;
       await delay(MIN_DELAY);
 
     } catch (err: unknown) {
@@ -222,13 +190,11 @@ export async function fetchAllCandles(options: FetchOptions): Promise<Candle[]> 
         );
       }
 
-      await delay(MIN_DELAY * 3);
+      await delay(MIN_DELAY * 4);
     }
   }
 
-  // Sort ascending by time, then take the latest N candles
   const sorted = Array.from(candlesByTime.values()).sort((a, b) => a.t - b.t);
-  console.log(`Fetch complete. Unique candles collected: ${sorted.length}`);
-
+  console.log(`Fetch complete. Total candles: ${sorted.length}`);
   return sorted.slice(-candleCount);
 }
