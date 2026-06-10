@@ -4,7 +4,7 @@ import type { Candle, Symbol, TimeFrame } from '../types';
 // Twelve Data API
 // Get your free key at: https://twelvedata.com/account/api-keys
 // ---------------------------------------------------------------------------
-const API_KEY = '12cea044900f49b29df57b55293548a2';
+const API_KEY = 'YOUR_API_KEY_HERE';
 const API_BASE = 'https://api.twelvedata.com/time_series';
 const MAX_PER_REQUEST = 5000; // Twelve Data allows up to 5000 per call
 const MIN_DELAY = 300;        // ms between paginated requests
@@ -197,4 +197,5 @@ export async function fetchAllCandles(options: FetchOptions): Promise<Candle[]> 
   const sorted = Array.from(candlesByTime.values()).sort((a, b) => a.t - b.t);
   console.log(`Fetch complete. Total candles: ${sorted.length}`);
   return sorted.slice(-candleCount);
-}
+  }
+  
