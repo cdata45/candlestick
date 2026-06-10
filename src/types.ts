@@ -1,5 +1,5 @@
 export interface Candle {
-  t: number; // Unix timestamp (UTC)
+  t: number; // timestamp
   o: number; // open
   h: number; // high
   l: number; // low
@@ -7,7 +7,6 @@ export interface Candle {
   v: number; // volume
 }
 
-// Twelve Data response — internal use in fetchCandles.ts
 export interface ApiResponse {
   status: string;
   data: Candle[];
