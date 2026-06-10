@@ -1,4 +1,6 @@
 {
+  "start_url": "/candlestick/",
+  "scope": "/candlestick/"
   "name": "Bitycle Chart Viewer",
   "short_name": "Bitycle Chart",
   "description": "Professional candlestick chart viewer with data export capabilities",
