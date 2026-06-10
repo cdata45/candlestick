@@ -185,5 +185,5 @@ export async function fetchAllCandles(options: FetchOptions): Promise<Candle[]> 
   const sorted = Array.from(candlesByTime.values()).sort((a, b) => a.t - b.t);
   console.log(`Fetch complete. Total candles: ${sorted.length}`);
   return sorted.slice(-candleCount);
-        }
-  
+    }
+        
