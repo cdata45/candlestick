@@ -1,34 +1,17 @@
-import type { Candle, Symbol, TimeFrame } from '../types';
+import type { Candle, ApiResponse, Symbol, TimeFrame } from '../types';
 
-// ---------------------------------------------------------------------------
-// Twelve Data API
-// Get your free key at: https://twelvedata.com/account/api-keys
-// ---------------------------------------------------------------------------
-const API_KEY = 'YOUR_API_KEY_HERE';
-const API_BASE = 'https://api.twelvedata.com/time_series';
-const MAX_PER_REQUEST = 5000; // Twelve Data allows up to 5000 per call
-const MIN_DELAY = 300;        // ms between paginated requests
+const API_BASE = 'https://widget-data.bitycle.com/c1/api/exchange/widget_data';
+const MIN_DELAY = 250;
+const MAX_FETCH_ATTEMPTS = 20;
+const EMPTY_PAGE_SEARCH_STEP_SECONDS = 60 * 60; // 1 hour
+const MAX_EMPTY_PAGE_SEARCH_ATTEMPTS = 120;
 const MAX_CONSECUTIVE_ERRORS = 3;
 
-// Map app symbols → Twelve Data symbols
-const SYMBOL_MAP: Record<Symbol, string> = {
-  XAUUSD: 'XAU/USD',
-  XAGUSD: 'XAG/USD',
-  EURUSD: 'EUR/USD',
-  GBPUSD: 'GBP/USD',
-  BTCUSD: 'BTC/USD',
-};
-
-// Map app timeframes → Twelve Data intervals
-const TIMEFRAME_MAP: Record<TimeFrame, string> = {
-  '1m':  '1min',
-  '5m':  '5min',
-  '15m': '15min',
-  '30m': '30min',
-  '1h':  '1h',
-  '4h':  '4h',
-  '1d':  '1day',
-};
+const CORS_PROXIES = [
+  (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+  (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  (url: string) => `https://cors-anywhere.herokuapp.com/${url}`,
+];
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -42,128 +25,129 @@ export interface FetchOptions {
   abortSignal?: AbortSignal;
 }
 
-interface TwelveCandle {
-  datetime: string; // "2024-01-15 14:30:00"
-  open: string;
-  high: string;
-  low: string;
-  close: string;
-  volume: string;
+async function tryFetch(url: string, signal?: AbortSignal): Promise<ApiResponse> {
+  // Try proxies first — avoids CORS block from browsers without GitHub session
+  for (let i = 0; i < CORS_PROXIES.length; i++) {
+    const proxyUrl = CORS_PROXIES[i](url);
+    try {
+      console.log(`Trying proxy ${i + 1}/${CORS_PROXIES.length}`);
+      const res = await fetch(proxyUrl, { method: 'GET', signal, headers: { 'Accept': 'application/json' } });
+      if (res.ok) {
+        const text = await res.text();
+        try {
+          const data = JSON.parse(text);
+          console.log(`Proxy ${i + 1} succeeded`);
+          return data as ApiResponse;
+        } catch {
+          console.log(`Proxy ${i + 1} returned invalid JSON`);
+        }
+      }
+    } catch (e) {
+      console.log(`Proxy ${i + 1} failed:`, e);
+    }
+  }
+
+  // Fallback: direct fetch (works when GitHub is open in same browser)
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      signal,
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://widget-data.bitycle.com',
+        'Referer': 'https://widget-data.bitycle.com/',
+      },
+    });
+    if (res.ok) {
+      console.log('Direct fetch succeeded');
+      return res.json() as Promise<ApiResponse>;
+    }
+  } catch (e) {
+    console.log('Direct fetch also failed:', e);
+  }
+
+  throw new Error('All fetch methods failed. The API may be blocking requests.');
 }
 
-interface TwelveResponse {
-  status: string;
-  message?: string;
-  code?: number;
-  values?: TwelveCandle[];
-  meta?: { symbol: string; interval: string; exchange: string };
-}
-
-// Parse "2024-01-15 14:30:00" (UTC) to Unix timestamp
-function parseDatetime(dt: string): number {
-  // Twelve Data daily candles return "2024-01-15" without time
-  const normalized = dt.length === 10 ? `${dt} 00:00:00` : dt;
-  return Math.floor(new Date(`${normalized}Z`).getTime() / 1000);
-}
-
-// Fetch one page ending at (and including) endDatetime
-// endDatetime format: "YYYY-MM-DD HH:mm:ss"
-async function fetchPage(
+async function fetchCandlePage(
   symbol: Symbol,
   timeFrame: TimeFrame,
-  outputSize: number,
-  endDatetime: string | null,
+  endTimestamp: number,
   signal?: AbortSignal,
 ): Promise<Candle[]> {
   const params = new URLSearchParams({
-    symbol:   SYMBOL_MAP[symbol],
-    interval: TIMEFRAME_MAP[timeFrame],
-    outputsize: String(outputSize),
-    order:    'DESC', // newest first — we paginate backward
-    apikey:   API_KEY,
+    symbol,
+    time_frame: timeFrame,
+    source: 'alpari',
+    end: endTimestamp.toString(),
   });
-
-  if (endDatetime) {
-    params.set('end_date', endDatetime);
-  }
 
   const url = `${API_BASE}?${params.toString()}`;
-  console.log('Fetching:', url.replace(API_KEY, '***'));
+  console.log('Fetching:', url);
 
-  const response = await fetch(url, {
-    signal,
-    headers: { 'Accept': 'application/json' },
-  });
+  const json = await tryFetch(url, signal);
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-  }
+  if (json.status !== 'success') throw new Error(`API returned status: ${json.status}`);
+  if (!json.data || !Array.isArray(json.data)) return [];
 
-  const json: TwelveResponse = await response.json();
-
-  if (json.status === 'error') {
-    // Code 429 = rate limit, code 400 = bad params
-    throw new Error(`Twelve Data error ${json.code ?? ''}: ${json.message ?? 'Unknown error'}`);
-  }
-
-  if (!json.values || json.values.length === 0) {
-    return [];
-  }
-
-  return json.values.map((v) => ({
-    t: parseDatetime(v.datetime),
-    o: parseFloat(v.open),
-    h: parseFloat(v.high),
-    l: parseFloat(v.low),
-    c: parseFloat(v.close),
-    v: parseFloat(v.volume) || 0,
-  }));
+  return json.data
+    .filter((c) => c && typeof c.t === 'number')
+    .map((c) => ({ t: c.t, o: c.o, h: c.h, l: c.l, c: c.c, v: c.v ?? 0 }));
 }
 
-// Format Unix timestamp back to "YYYY-MM-DD HH:mm:ss" for the API end_date param
-function formatEndDate(unixSeconds: number): string {
-  const d = new Date(unixSeconds * 1000);
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return (
-    `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}` +
-    ` ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`
-  );
+async function findPreviousAvailablePage(
+  symbol: Symbol,
+  timeFrame: TimeFrame,
+  endTimestamp: number,
+  signal?: AbortSignal,
+): Promise<Candle[]> {
+  console.log('Empty response — searching backward hour by hour...');
+  let searchEnd = endTimestamp;
+
+  for (let attempt = 1; attempt <= MAX_EMPTY_PAGE_SEARCH_ATTEMPTS; attempt++) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    searchEnd -= EMPTY_PAGE_SEARCH_STEP_SECONDS;
+    console.log(`Search attempt ${attempt} with end=${new Date(searchEnd * 1000).toISOString()}`);
+    const page = await fetchCandlePage(symbol, timeFrame, searchEnd, signal);
+    if (page.length > 0) {
+      console.log('Found older data at', new Date(searchEnd * 1000).toISOString());
+      return page;
+    }
+    await delay(MIN_DELAY);
+  }
+
+  throw new Error(`Could not find older data after ${MAX_EMPTY_PAGE_SEARCH_ATTEMPTS} hours of search.`);
 }
 
 export async function fetchAllCandles(options: FetchOptions): Promise<Candle[]> {
   const { symbol, timeFrame, candleCount, onProgress, abortSignal } = options;
 
   const candlesByTime = new Map<number, Candle>();
-  let endDatetime: string | null = null; // null = start from latest (real-time)
+  let endTimestamp = Math.floor(Date.now() / 1000);
   let consecutiveErrors = 0;
 
   console.log(`Starting fetch: ${symbol} ${timeFrame}, requesting ${candleCount} candles`);
 
-  while (candlesByTime.size < candleCount) {
+  for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
     if (abortSignal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
-    const remaining = candleCount - candlesByTime.size;
-    const pageSize = Math.min(remaining, MAX_PER_REQUEST);
-
     console.log(
-      `Fetching page — end=${endDatetime ?? 'latest'} — ` +
-      `collected ${candlesByTime.size}/${candleCount}`,
+      `Page ${attempt} — end=${new Date(endTimestamp * 1000).toISOString()}` +
+      ` — collected ${candlesByTime.size}/${candleCount}`,
     );
 
     try {
-      const page = await fetchPage(symbol, timeFrame, pageSize, endDatetime, abortSignal);
-      consecutiveErrors = 0;
+      let page = await fetchCandlePage(symbol, timeFrame, endTimestamp, abortSignal);
 
       if (page.length === 0) {
-        console.log('Empty page — no more historical data available');
-        break;
+        page = await findPreviousAvailablePage(symbol, timeFrame, endTimestamp, abortSignal);
       }
 
-      // page is DESC (newest first), add all
+      consecutiveErrors = 0;
+
       for (const candle of page) {
-        if (!candlesByTime.has(candle.t)) {
-          candlesByTime.set(candle.t, candle);
-        }
+        if (!candlesByTime.has(candle.t)) candlesByTime.set(candle.t, candle);
       }
 
       onProgress(candlesByTime.size);
@@ -171,10 +155,14 @@ export async function fetchAllCandles(options: FetchOptions): Promise<Candle[]> 
 
       if (candlesByTime.size >= candleCount) break;
 
-      // Oldest candle in this page → next end_date is one second before it
       const oldestTimestamp = Math.min(...page.map((c) => c.t));
-      endDatetime = formatEndDate(oldestTimestamp - 1);
+      const nextEnd = oldestTimestamp - 1;
 
+      if (nextEnd >= endTimestamp) {
+        throw new Error('API pagination did not move backward — stopping.');
+      }
+
+      endTimestamp = nextEnd;
       await delay(MIN_DELAY);
 
     } catch (err: unknown) {
@@ -190,12 +178,12 @@ export async function fetchAllCandles(options: FetchOptions): Promise<Candle[]> 
         );
       }
 
-      await delay(MIN_DELAY * 4);
+      await delay(MIN_DELAY * 3);
     }
   }
 
   const sorted = Array.from(candlesByTime.values()).sort((a, b) => a.t - b.t);
   console.log(`Fetch complete. Total candles: ${sorted.length}`);
   return sorted.slice(-candleCount);
-  }
+        }
   
