@@ -8,6 +8,11 @@ import { viteSingleFile } from "vite-plugin-singlefile";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+export default defineConfig({
+  base: '/candlestick/',
+  plugins: [react(), tailwindcss(), viteSingleFile()],
+  ...
+}),
 // https://vite.dev/config/
 export default defineConfig({
   base: '/candlestick/',
