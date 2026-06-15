@@ -26,12 +26,43 @@ export interface FetchOptions {
 }
 
 async function tryFetch(url: string, signal?: AbortSignal): Promise<ApiResponse> {
-  // Try proxies first — avoids CORS block from browsers without GitHub session
+  // ✅ اول Direct Fetch — سریع‌ترین روش، بدون واسطه
+  try {
+    console.log('Trying direct fetch...');
+    const res = await fetch(url, {
+      method: 'GET',
+      signal,
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://widget-data.bitycle.com',
+        'Referer': 'https://widget-data.bitycle.com/',
+      },
+    });
+    if (res.ok) {
+      const text = await res.text();
+      try {
+        const data = JSON.parse(text);
+        console.log('Direct fetch succeeded');
+        return data as ApiResponse;
+      } catch {
+        console.log('Direct fetch returned invalid JSON');
+      }
+    }
+  } catch (e) {
+    console.log('Direct fetch failed (likely CORS):', e);
+  }
+
+  // ✅ اگه Direct کار نکرد، پروکسی‌ها رو امتحان می‌کنه
   for (let i = 0; i < CORS_PROXIES.length; i++) {
     const proxyUrl = CORS_PROXIES[i](url);
     try {
-      console.log(`Trying proxy ${i + 1}/${CORS_PROXIES.length}`);
-      const res = await fetch(proxyUrl, { method: 'GET', signal, headers: { 'Accept': 'application/json' } });
+      console.log(`Trying proxy ${i + 1}/${CORS_PROXIES.length}...`);
+      const res = await fetch(proxyUrl, {
+        method: 'GET',
+        signal,
+        headers: { 'Accept': 'application/json' },
+      });
       if (res.ok) {
         const text = await res.text();
         try {
@@ -45,26 +76,6 @@ async function tryFetch(url: string, signal?: AbortSignal): Promise<ApiResponse>
     } catch (e) {
       console.log(`Proxy ${i + 1} failed:`, e);
     }
-  }
-
-  // Fallback: direct fetch (works when GitHub is open in same browser)
-  try {
-    const res = await fetch(url, {
-      method: 'GET',
-      signal,
-      headers: {
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Origin': 'https://widget-data.bitycle.com',
-        'Referer': 'https://widget-data.bitycle.com/',
-      },
-    });
-    if (res.ok) {
-      console.log('Direct fetch succeeded');
-      return res.json() as Promise<ApiResponse>;
-    }
-  } catch (e) {
-    console.log('Direct fetch also failed:', e);
   }
 
   throw new Error('All fetch methods failed. The API may be blocking requests.');
@@ -185,5 +196,5 @@ export async function fetchAllCandles(options: FetchOptions): Promise<Candle[]> 
   const sorted = Array.from(candlesByTime.values()).sort((a, b) => a.t - b.t);
   console.log(`Fetch complete. Total candles: ${sorted.length}`);
   return sorted.slice(-candleCount);
-    }
-        
+                                                 }
+  
