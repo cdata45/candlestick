@@ -42,7 +42,7 @@ export function downloadExcel(candles: Candle[], symbol: string, timeFrame: stri
     { wch: 12 }, // volume
   ];
 
-  const filename = `${symbol}_${timeFrame}_${candles.length}candles_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  const filename = `${symbol.replace('/', '')}_${timeFrame}_${candles.length}candles_${new Date().toISOString().slice(0, 10)}.xlsx`;
   XLSX.writeFile(wb, filename);
 }
 
