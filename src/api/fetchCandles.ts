@@ -1,21 +1,7 @@
-import type { Candle, ApiResponse, Symbol, TimeFrame } from '../types';
+import type { Candle, Symbol, TimeFrame } from '../types';
 
-const API_BASE = 'https://widget-data.bitycle.com/c1/api/exchange/widget_data';
-const MIN_DELAY = 250;
-const MAX_FETCH_ATTEMPTS = 20;
-const EMPTY_PAGE_SEARCH_STEP_SECONDS = 60 * 60; // 1 hour
-const MAX_EMPTY_PAGE_SEARCH_ATTEMPTS = 120;
-const MAX_CONSECUTIVE_ERRORS = 3;
-
-const CORS_PROXIES = [
-  (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-  (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  (url: string) => `https://cors-anywhere.herokuapp.com/${url}`,
-];
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const API_KEY = '82c11f0706c647a286e2cc089f7b4163';
+const API_BASE = 'https://api.twelvedata.com';
 
 export interface FetchOptions {
   symbol: Symbol;
@@ -25,176 +11,134 @@ export interface FetchOptions {
   abortSignal?: AbortSignal;
 }
 
-async function tryFetch(url: string, signal?: AbortSignal): Promise<ApiResponse> {
-  // ✅ اول Direct Fetch — سریع‌ترین روش، بدون واسطه
-  try {
-    console.log('Trying direct fetch...');
-    const res = await fetch(url, {
-      method: 'GET',
-      signal,
-      headers: {
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Origin': 'https://widget-data.bitycle.com',
-        'Referer': 'https://widget-data.bitycle.com/',
-      },
-    });
-    if (res.ok) {
-      const text = await res.text();
-      try {
-        const data = JSON.parse(text);
-        console.log('Direct fetch succeeded');
-        return data as ApiResponse;
-      } catch {
-        console.log('Direct fetch returned invalid JSON');
-      }
-    }
-  } catch (e) {
-    console.log('Direct fetch failed (likely CORS):', e);
-  }
-
-  // ✅ اگه Direct کار نکرد، پروکسی‌ها رو امتحان می‌کنه
-  for (let i = 0; i < CORS_PROXIES.length; i++) {
-    const proxyUrl = CORS_PROXIES[i](url);
-    try {
-      console.log(`Trying proxy ${i + 1}/${CORS_PROXIES.length}...`);
-      const res = await fetch(proxyUrl, {
-        method: 'GET',
-        signal,
-        headers: { 'Accept': 'application/json' },
-      });
-      if (res.ok) {
-        const text = await res.text();
-        try {
-          const data = JSON.parse(text);
-          console.log(`Proxy ${i + 1} succeeded`);
-          return data as ApiResponse;
-        } catch {
-          console.log(`Proxy ${i + 1} returned invalid JSON`);
-        }
-      }
-    } catch (e) {
-      console.log(`Proxy ${i + 1} failed:`, e);
-    }
-  }
-
-  throw new Error('All fetch methods failed. The API may be blocking requests.');
+function toTwelveDataInterval(tf: TimeFrame): string {
+  return tf; // already in Twelve Data format: 1min, 5min, 1h, 4h, 1day, 1week
 }
 
-async function fetchCandlePage(
-  symbol: Symbol,
-  timeFrame: TimeFrame,
-  endTimestamp: number,
-  signal?: AbortSignal,
-): Promise<Candle[]> {
-  const params = new URLSearchParams({
-    symbol,
-    time_frame: timeFrame,
-    source: 'alpari',
-    end: endTimestamp.toString(),
-  });
-
-  const url = `${API_BASE}?${params.toString()}`;
-  console.log('Fetching:', url);
-
-  const json = await tryFetch(url, signal);
-
-  if (json.status !== 'success') throw new Error(`API returned status: ${json.status}`);
-  if (!json.data || !Array.isArray(json.data)) return [];
-
-  return json.data
-    .filter((c) => c && typeof c.t === 'number')
-    .map((c) => ({ t: c.t, o: c.o, h: c.h, l: c.l, c: c.c, v: c.v ?? 0 }));
-}
-
-async function findPreviousAvailablePage(
-  symbol: Symbol,
-  timeFrame: TimeFrame,
-  endTimestamp: number,
-  signal?: AbortSignal,
-): Promise<Candle[]> {
-  console.log('Empty response — searching backward hour by hour...');
-  let searchEnd = endTimestamp;
-
-  for (let attempt = 1; attempt <= MAX_EMPTY_PAGE_SEARCH_ATTEMPTS; attempt++) {
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    searchEnd -= EMPTY_PAGE_SEARCH_STEP_SECONDS;
-    console.log(`Search attempt ${attempt} with end=${new Date(searchEnd * 1000).toISOString()}`);
-    const page = await fetchCandlePage(symbol, timeFrame, searchEnd, signal);
-    if (page.length > 0) {
-      console.log('Found older data at', new Date(searchEnd * 1000).toISOString());
-      return page;
-    }
-    await delay(MIN_DELAY);
-  }
-
-  throw new Error(`Could not find older data after ${MAX_EMPTY_PAGE_SEARCH_ATTEMPTS} hours of search.`);
+function parseCandles(values: Array<Record<string, string>>): Candle[] {
+  return values.map((v) => ({
+    t: Math.floor(new Date(v.datetime).getTime() / 1000),
+    o: parseFloat(v.open),
+    h: parseFloat(v.high),
+    l: parseFloat(v.low),
+    c: parseFloat(v.close),
+    v: parseFloat(v.volume ?? '0'),
+  }));
 }
 
 export async function fetchAllCandles(options: FetchOptions): Promise<Candle[]> {
   const { symbol, timeFrame, candleCount, onProgress, abortSignal } = options;
+  const interval = toTwelveDataInterval(timeFrame);
 
-  const candlesByTime = new Map<number, Candle>();
-  let endTimestamp = Math.floor(Date.now() / 1000);
-  let consecutiveErrors = 0;
+  // Twelve Data max per request is 5000; we batch if needed
+  const perPage = Math.min(candleCount, 5000);
 
-  console.log(`Starting fetch: ${symbol} ${timeFrame}, requesting ${candleCount} candles`);
+  const url = new URL(`${API_BASE}/time_series`);
+  url.searchParams.set('symbol', symbol);
+  url.searchParams.set('interval', interval);
+  url.searchParams.set('outputsize', String(perPage));
+  url.searchParams.set('apikey', API_KEY);
+  url.searchParams.set('format', 'JSON');
+  url.searchParams.set('order', 'ASC');
 
-  for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
-    if (abortSignal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  const res = await fetch(url.toString(), { signal: abortSignal });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
 
-    console.log(
-      `Page ${attempt} — end=${new Date(endTimestamp * 1000).toISOString()}` +
-      ` — collected ${candlesByTime.size}/${candleCount}`,
-    );
+  const json = await res.json();
 
+  if (json.status === 'error') {
+    throw new Error(json.message || 'Twelve Data API error');
+  }
+
+  if (!json.values || !Array.isArray(json.values)) {
+    throw new Error('Unexpected API response format');
+  }
+
+  const candles = parseCandles(json.values);
+  onProgress(candles.length);
+  return candles;
+}
+
+// Fetch only the latest candle (for live polling)
+export async function fetchLatestCandle(
+  symbol: Symbol,
+  timeFrame: TimeFrame,
+  signal?: AbortSignal,
+): Promise<Candle | null> {
+  const interval = toTwelveDataInterval(timeFrame);
+
+  const url = new URL(`${API_BASE}/time_series`);
+  url.searchParams.set('symbol', symbol);
+  url.searchParams.set('interval', interval);
+  url.searchParams.set('outputsize', '1');
+  url.searchParams.set('apikey', API_KEY);
+  url.searchParams.set('format', 'JSON');
+
+  try {
+    const res = await fetch(url.toString(), { signal });
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json.values?.[0]) return null;
+    const [latest] = parseCandles(json.values);
+    return latest;
+  } catch {
+    return null;
+  }
+}
+
+// WebSocket live price feed
+export function createLiveFeed(
+  symbol: Symbol,
+  onPrice: (price: number, timestamp: number) => void,
+  onStatusChange: (connected: boolean) => void,
+): () => void {
+  let ws: WebSocket | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let destroyed = false;
+
+  function connect() {
+    if (destroyed) return;
     try {
-      let page = await fetchCandlePage(symbol, timeFrame, endTimestamp, abortSignal);
+      ws = new WebSocket(`wss://ws.twelvedata.com/v1/quotes/price?apikey=${API_KEY}`);
 
-      if (page.length === 0) {
-        page = await findPreviousAvailablePage(symbol, timeFrame, endTimestamp, abortSignal);
+      ws.onopen = () => {
+        onStatusChange(true);
+        ws?.send(JSON.stringify({ action: 'subscribe', params: { symbols: symbol } }));
+      };
+
+      ws.onmessage = (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          if (d.price) {
+            onPrice(parseFloat(d.price), Math.floor(Date.now() / 1000));
+          }
+        } catch { /* ignore */ }
+      };
+
+      ws.onerror = () => {
+        onStatusChange(false);
+      };
+
+      ws.onclose = () => {
+        onStatusChange(false);
+        if (!destroyed) {
+          reconnectTimer = setTimeout(connect, 5000);
+        }
+      };
+    } catch {
+      onStatusChange(false);
+      if (!destroyed) {
+        reconnectTimer = setTimeout(connect, 5000);
       }
-
-      consecutiveErrors = 0;
-
-      for (const candle of page) {
-        if (!candlesByTime.has(candle.t)) candlesByTime.set(candle.t, candle);
-      }
-
-      onProgress(candlesByTime.size);
-      console.log(`Page had ${page.length} candles — total unique: ${candlesByTime.size}`);
-
-      if (candlesByTime.size >= candleCount) break;
-
-      const oldestTimestamp = Math.min(...page.map((c) => c.t));
-      const nextEnd = oldestTimestamp - 1;
-
-      if (nextEnd >= endTimestamp) {
-        throw new Error('API pagination did not move backward — stopping.');
-      }
-
-      endTimestamp = nextEnd;
-      await delay(MIN_DELAY);
-
-    } catch (err: unknown) {
-      if (err instanceof DOMException && err.name === 'AbortError') throw err;
-
-      consecutiveErrors++;
-      console.error(`Fetch error (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}):`, err);
-
-      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-        throw new Error(
-          `Failed after ${MAX_CONSECUTIVE_ERRORS} consecutive errors: ` +
-          (err instanceof Error ? err.message : 'Unknown error'),
-        );
-      }
-
-      await delay(MIN_DELAY * 3);
     }
   }
 
-  const sorted = Array.from(candlesByTime.values()).sort((a, b) => a.t - b.t);
-  console.log(`Fetch complete. Total candles: ${sorted.length}`);
-  return sorted.slice(-candleCount);
-                                                 }
-  
+  connect();
+
+  // Return cleanup function
+  return () => {
+    destroyed = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    ws?.close();
+  };
+}
