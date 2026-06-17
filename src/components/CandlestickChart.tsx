@@ -6,9 +6,10 @@ import type { Candle } from '../types';
 interface CandlestickChartProps {
   candles: Candle[];
   symbol: string;
+  livePrice?: number | null;
 }
 
-export default function CandlestickChart({ candles, symbol }: CandlestickChartProps) {
+export default function CandlestickChart({ candles, symbol, livePrice }: CandlestickChartProps) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
@@ -31,25 +32,12 @@ export default function CandlestickChart({ candles, symbol }: CandlestickChartPr
       },
       crosshair: {
         mode: CrosshairMode.Normal,
-        vertLine: {
-          color: '#6366f1',
-          width: 1,
-          style: 2,
-          labelBackgroundColor: '#6366f1',
-        },
-        horzLine: {
-          color: '#6366f1',
-          width: 1,
-          style: 2,
-          labelBackgroundColor: '#6366f1',
-        },
+        vertLine: { color: '#6366f1', width: 1, style: 2, labelBackgroundColor: '#6366f1' },
+        horzLine: { color: '#6366f1', width: 1, style: 2, labelBackgroundColor: '#6366f1' },
       },
       rightPriceScale: {
         borderColor: '#334155',
-        scaleMargins: {
-          top: 0.05,
-          bottom: 0.25,
-        },
+        scaleMargins: { top: 0.05, bottom: 0.25 },
       },
       timeScale: {
         borderColor: '#334155',
@@ -58,9 +46,7 @@ export default function CandlestickChart({ candles, symbol }: CandlestickChartPr
         rightOffset: 5,
         barSpacing: 8,
       },
-      handleScroll: {
-        vertTouchDrag: false,
-      },
+      handleScroll: { vertTouchDrag: false },
       width: container.clientWidth,
       height: container.clientHeight,
     });
@@ -75,33 +61,21 @@ export default function CandlestickChart({ candles, symbol }: CandlestickChartPr
       wickUpColor: '#22c55e',
       wickDownColor: '#ef4444',
     });
-
     candleSeriesRef.current = candleSeries;
 
     const volumeSeries = chart.addSeries(HistogramSeries, {
-      priceFormat: {
-        type: 'volume',
-      },
+      priceFormat: { type: 'volume' },
       priceScaleId: '',
     });
-
-    volumeSeries.priceScale().applyOptions({
-      scaleMargins: {
-        top: 0.8,
-        bottom: 0,
-      },
-    });
-
+    volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
     volumeSeriesRef.current = volumeSeries;
 
-    // Handle resize
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
         chart.applyOptions({ width, height });
       }
     });
-
     resizeObserver.observe(container);
 
     return () => {
@@ -113,6 +87,7 @@ export default function CandlestickChart({ candles, symbol }: CandlestickChartPr
     };
   }, []);
 
+  // Load historical candles
   useEffect(() => {
     if (!candleSeriesRef.current || !volumeSeriesRef.current || candles.length === 0) return;
 
@@ -132,23 +107,30 @@ export default function CandlestickChart({ candles, symbol }: CandlestickChartPr
 
     candleSeriesRef.current.setData(candleData);
     volumeSeriesRef.current.setData(volumeData);
-
-    // Fit content to view
-    if (chartRef.current) {
-      chartRef.current.timeScale().fitContent();
-    }
+    chartRef.current?.timeScale().fitContent();
   }, [candles]);
+
+  // Apply live price to last candle
+  useEffect(() => {
+    if (!candleSeriesRef.current || !volumeSeriesRef.current || candles.length === 0 || livePrice == null) return;
+
+    const last = candles[candles.length - 1];
+    const updatedCandle: CandlestickData<Time> = {
+      time: last.t as Time,
+      open: last.o,
+      high: Math.max(last.h, livePrice),
+      low: Math.min(last.l, livePrice),
+      close: livePrice,
+    };
+    candleSeriesRef.current.update(updatedCandle);
+  }, [livePrice, candles]);
 
   return (
     <div className="relative w-full">
       <div className="absolute top-2 left-2 z-10 bg-slate-900/80 px-3 py-1 rounded-md text-xs text-indigo-400 font-medium backdrop-blur-sm border border-slate-700/50">
         📊 {symbol}
       </div>
-      <div
-        ref={chartContainerRef}
-        className="w-full"
-        style={{ height: '400px' }}
-      />
+      <div ref={chartContainerRef} className="w-full" style={{ height: '400px' }} />
     </div>
   );
 }
