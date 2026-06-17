@@ -12,7 +12,7 @@ export interface FetchOptions {
 }
 
 function toTwelveDataInterval(tf: TimeFrame): string {
-  return tf; // already in Twelve Data format: 1min, 5min, 1h, 4h, 1day, 1week
+  return tf;
 }
 
 function parseCandles(values: Array<Record<string, string>>): Candle[] {
@@ -26,11 +26,89 @@ function parseCandles(values: Array<Record<string, string>>): Candle[] {
   }));
 }
 
+/**
+ * فیلتر کندل‌های فیک:
+ * کندل‌هایی که بازار بسته بوده (تعطیلی آخر هفته یا ساعات بسته)
+ * را با سه معیار شناسایی می‌کنیم:
+ * 1. range بسیار کوچیک نسبت به قیمت (کمتر از 0.002%)
+ * 2. open == close یا اختلاف بسیار ناچیز
+ * 3. volume == 0 همراه با range مشکوک
+ */
+function isGhostCandle(candle: Candle): boolean {
+  const range = candle.h - candle.l;
+  const mid = (candle.h + candle.l) / 2;
+  if (mid === 0) return true;
+
+  const rangePct = (range / mid) * 100;
+
+  // اگه رنج کمتر از 0.003% باشه → کندل فیک
+  // (برای فارکس و طلا این عدد خیلی غیرطبیعیه)
+  return rangePct < 0.003;
+}
+
+/**
+ * تشخیص Heikin Ashi: اگه open هر کندل دقیقاً برابر
+ * میانگین open+close کندل قبلی باشه، دیتا HA هست.
+ * در اینصورت دیتا رو به candlestick واقعی برمی‌گردونیم.
+ */
+function isHeikinAshi(candles: Candle[]): boolean {
+  if (candles.length < 3) return false;
+  let haCount = 0;
+  for (let i = 1; i < Math.min(candles.length, 10); i++) {
+    const prev = candles[i - 1];
+    const curr = candles[i];
+    const expectedOpen = (prev.o + prev.c) / 2;
+    if (Math.abs(curr.o - expectedOpen) < 0.0001 * curr.o) {
+      haCount++;
+    }
+  }
+  return haCount >= 6; // بیشتر از 60% کندل‌ها HA هستن
+}
+
+/**
+ * تبدیل Heikin Ashi به Candlestick واقعی
+ * فرمول معکوس: realClose = 2*haClose - haOpen
+ *               realOpen  = 2*prevHaOpen - prevRealOpen
+ */
+function convertHAToCandlestick(haCandles: Candle[]): Candle[] {
+  const result: Candle[] = [];
+  let prevRealOpen = haCandles[0].o * 2 - haCandles[0].c; // تخمین اولیه
+
+  for (let i = 0; i < haCandles.length; i++) {
+    const ha = haCandles[i];
+    const realClose = 2 * ha.c - ha.o;
+    const realOpen = i === 0 ? prevRealOpen : 2 * haCandles[i - 1].o - result[i - 1].o;
+
+    result.push({
+      t: ha.t,
+      o: parseFloat(realOpen.toFixed(5)),
+      h: ha.h,
+      l: ha.l,
+      c: parseFloat(realClose.toFixed(5)),
+      v: ha.v,
+    });
+    prevRealOpen = realOpen;
+  }
+  return result;
+}
+
+function cleanCandles(candles: Candle[]): Candle[] {
+  // اول فیلتر ghost candles
+  const filtered = candles.filter((c) => !isGhostCandle(c));
+
+  // بعد چک HA
+  if (isHeikinAshi(filtered)) {
+    console.warn('Heikin Ashi data detected — converting to real candlestick...');
+    return convertHAToCandlestick(filtered);
+  }
+
+  return filtered;
+}
+
 export async function fetchAllCandles(options: FetchOptions): Promise<Candle[]> {
   const { symbol, timeFrame, candleCount, onProgress, abortSignal } = options;
   const interval = toTwelveDataInterval(timeFrame);
 
-  // Twelve Data max per request is 5000; we batch if needed
   const perPage = Math.min(candleCount, 5000);
 
   const url = new URL(`${API_BASE}/time_series`);
@@ -54,12 +132,14 @@ export async function fetchAllCandles(options: FetchOptions): Promise<Candle[]> 
     throw new Error('Unexpected API response format');
   }
 
-  const candles = parseCandles(json.values);
+  const raw = parseCandles(json.values);
+  const candles = cleanCandles(raw);
+
+  console.log(`Raw: ${raw.length} candles → After filter: ${candles.length} candles`);
   onProgress(candles.length);
   return candles;
 }
 
-// Fetch only the latest candle (for live polling)
 export async function fetchLatestCandle(
   symbol: Symbol,
   timeFrame: TimeFrame,
@@ -70,7 +150,7 @@ export async function fetchLatestCandle(
   const url = new URL(`${API_BASE}/time_series`);
   url.searchParams.set('symbol', symbol);
   url.searchParams.set('interval', interval);
-  url.searchParams.set('outputsize', '1');
+  url.searchParams.set('outputsize', '2'); // 2 تا می‌گیریم تا ghost رو بتونیم تشخیص بدیم
   url.searchParams.set('apikey', API_KEY);
   url.searchParams.set('format', 'JSON');
 
@@ -79,14 +159,14 @@ export async function fetchLatestCandle(
     if (!res.ok) return null;
     const json = await res.json();
     if (!json.values?.[0]) return null;
-    const [latest] = parseCandles(json.values);
-    return latest;
+    const parsed = parseCandles(json.values);
+    const cleaned = cleanCandles(parsed);
+    return cleaned[cleaned.length - 1] ?? null;
   } catch {
     return null;
   }
 }
 
-// WebSocket live price feed
 export function createLiveFeed(
   symbol: Symbol,
   onPrice: (price: number, timestamp: number) => void,
@@ -115,27 +195,20 @@ export function createLiveFeed(
         } catch { /* ignore */ }
       };
 
-      ws.onerror = () => {
-        onStatusChange(false);
-      };
+      ws.onerror = () => { onStatusChange(false); };
 
       ws.onclose = () => {
         onStatusChange(false);
-        if (!destroyed) {
-          reconnectTimer = setTimeout(connect, 5000);
-        }
+        if (!destroyed) reconnectTimer = setTimeout(connect, 5000);
       };
     } catch {
       onStatusChange(false);
-      if (!destroyed) {
-        reconnectTimer = setTimeout(connect, 5000);
-      }
+      if (!destroyed) reconnectTimer = setTimeout(connect, 5000);
     }
   }
 
   connect();
 
-  // Return cleanup function
   return () => {
     destroyed = true;
     if (reconnectTimer) clearTimeout(reconnectTimer);
