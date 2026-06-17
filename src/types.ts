@@ -12,21 +12,8 @@ export interface ApiResponse {
   data: Candle[];
 }
 
-export type Symbol =
-  | 'XAU/USD'
-  | 'XAG/USD'
-  | 'WTI/USD'
-  | 'EUR/USD'
-  | 'GBP/USD'
-  | 'USD/JPY'
-  | 'USD/CAD'
-  | 'AUD/USD'
-  | 'USD/CHF'
-  | 'GBP/JPY'
-  | 'EUR/JPY'
-  | 'NZD/USD';
-
-export type TimeFrame = '1min' | '5min' | '15min' | '30min' | '1h' | '4h' | '1day' | '1week';
+export type Symbol = 'XAUUSD' | 'XAGUSD' | 'EURUSD' | 'GBPUSD' | 'BTCUSD';
+export type TimeFrame = '1m' | '5m' | '15m' | '30m' | '1h' | '4h' | '1d';
 
 export interface FetchProgress {
   downloaded: number;
@@ -45,9 +32,4 @@ export interface Toast {
   id: number;
   message: string;
   type: 'success' | 'error' | 'info';
-}
-
-export interface LiveStatus {
-  connected: boolean;
-  lastUpdate: number | null;
 }
